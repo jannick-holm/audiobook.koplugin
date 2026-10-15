@@ -139,6 +139,135 @@ function MetadataParser:parseWithFfprobe(path)
 end
 
 -- ---------------------------------------------------------------------------
+-- ffmpeg-based parsing (fallback when ffprobe is missing)
+-- ---------------------------------------------------------------------------
+-- The release bundles a stripped ffmpeg built with --disable-ffprobe, so on
+-- Kobo/Kindle/PocketBook parseWithFfprobe() always fails and M4B chapters
+-- were never found.  `ffmpeg -i <file>` (no output file) prints the same
+-- container info that ffprobe reads, including the chapter list, to stderr.
+-- It only needs the demuxer, which the bundled build already includes.
+
+function MetadataParser:_shellQuote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+function MetadataParser:_ffmpegCandidates()
+    -- The bundled ffmpeg is a glibc Linux binary; spawning it on Android
+    -- crashes KOReader (see MediaEngine:_findFfmpegCandidates).
+    local ok_dev, Device = pcall(require, "device")
+    if ok_dev and Device and Device.isAndroid and Device:isAndroid() then
+        return {}
+    end
+    local candidates = {}
+    local seen = {}
+    local function add(p)
+        if p and p ~= "" and not seen[p] then
+            local f = io.open(p, "r")
+            if f then
+                f:close()
+                seen[p] = true
+                table.insert(candidates, p)
+            end
+        end
+    end
+    if self.plugin_dir then
+        local dir = self.plugin_dir:gsub("/+$", "")
+        -- MediaEngine renames ffmpeg.bin -> ffmpeg on first playback; accept
+        -- either so chapters also work before the first rename happened.
+        for _, name in ipairs({ "ffmpeg", "ffmpeg.bin", "ffmpeg-legacy" }) do
+            add(dir .. "/bin/" .. name)
+        end
+    end
+    local h = io.popen("command -v ffmpeg 2>/dev/null")
+    if h then
+        add(h:read("*l"))
+        h:close()
+    end
+    return candidates
+end
+
+--- Parse the stderr dump of `ffmpeg -i`.
+-- Exposed separately so it can be unit tested without a binary.
+-- @return chapters table (possibly empty), duration in seconds or nil
+function MetadataParser:_parseFfmpegInfo(output)
+    local chapters = {}
+    local duration = nil
+    local current = nil
+    local in_input = false
+
+    for line in (output .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+        if line:match("^Input #0") then
+            in_input = true
+        elseif line:match("^Input #%d") or line:match("^Output #") then
+            -- Only the first input is ours.
+            in_input = false
+            current = nil
+        end
+
+        if in_input then
+            local h, m, s = line:match("^%s+Duration:%s+(%d+):(%d+):([%d%.]+)")
+            if h and not duration then
+                duration = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+            end
+
+            local cs, ce = line:match("^%s+Chapter #%d+[:.]%d+: start ([%-%d%.]+), end ([%-%d%.]+)")
+            if cs then
+                current = {
+                    id = #chapters,
+                    title = nil,
+                    start_time = tonumber(cs),
+                    end_time = tonumber(ce),
+                }
+                table.insert(chapters, current)
+            elseif line:match("^%s+Stream #") or line:match("^%s+Program ") then
+                -- Stream metadata also has "title :" lines; stop collecting.
+                current = nil
+            elseif current and not current.title then
+                local title = line:match("^%s+title%s*:%s?(.*)$")
+                if title then
+                    current.title = title
+                end
+            end
+        end
+    end
+
+    local valid = {}
+    for _, ch in ipairs(chapters) do
+        if ch.start_time and ch.end_time and ch.end_time >= ch.start_time then
+            if not ch.title or ch.title:match("^%s*$") then
+                ch.title = "Chapter " .. (#valid + 1)
+            end
+            ch.id = #valid
+            table.insert(valid, ch)
+        end
+    end
+    return valid, duration
+end
+
+function MetadataParser:parseWithFfmpeg(path)
+    local candidates = self:_ffmpegCandidates()
+    if #candidates == 0 then
+        return nil, "ffmpeg not found"
+    end
+    for _, ffmpeg in ipairs(candidates) do
+        local cmd = string.format("%s -hide_banner -nostdin -i %s 2>&1",
+            self:_shellQuote(ffmpeg), self:_shellQuote(path))
+        local h = io.popen(cmd)
+        if h then
+            local out = h:read("*a") or ""
+            h:close()
+            if out:match("Input #0") then
+                local chapters, duration = self:_parseFfmpegInfo(out)
+                logger.warn("MetadataParser: ffmpeg found", #chapters, "chapters, duration=", duration)
+                return chapters, duration
+            end
+            logger.warn("MetadataParser: ffmpeg gave no container info via", ffmpeg)
+        end
+    end
+    return nil, "ffmpeg produced no output"
+end
+
+-- ---------------------------------------------------------------------------
 -- Fallback: minimal MP4 atom parser (M4B/M4A)
 -- ---------------------------------------------------------------------------
 
@@ -619,16 +748,28 @@ function MetadataParser:parse(path)
         return chapters, duration
     end
 
+    -- ffprobe is not bundled; the bundled ffmpeg can list chapters too.
+    -- Keep its duration even when the file has no chapters, so later
+    -- fallbacks (sidecar/cue) still get a real end time.
+    local ff_chapters, ff_duration = self:parseWithFfmpeg(path)
+    logger.warn("MetadataParser: ffmpeg returned", ff_chapters and #ff_chapters or "nil", "chapters")
+    if ff_chapters and #ff_chapters > 0 then
+        return ff_chapters, ff_duration
+    end
+    -- parseWithFfprobe returns (nil, "error message") on failure.
+    local known_duration = (type(duration) == "number" and duration)
+        or (type(ff_duration) == "number" and ff_duration) or nil
+
     -- Sidecar files work for any format, no external tools needed
-    chapters, duration = self:_parseSidecarChapters(path)
+    chapters = self:_parseSidecarChapters(path)
     logger.warn("MetadataParser: sidecar returned", chapters and #chapters or "nil", "chapters")
     if chapters and #chapters > 0 then
-        return chapters, duration
+        return chapters, known_duration
     end
 
-    chapters, duration = self:_parseCueSheet(path)
+    chapters = self:_parseCueSheet(path)
     if chapters and #chapters > 0 then
-        return chapters, duration
+        return chapters, known_duration
     end
 
     -- Format-specific binary fallbacks
@@ -640,6 +781,7 @@ function MetadataParser:parse(path)
         chapters, duration = self:_parseMp4Fallback(path)
     end
 
+    if type(duration) ~= "number" then duration = known_duration end
     if chapters and #chapters > 0 then
         return chapters, duration
     end
