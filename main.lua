@@ -456,6 +456,17 @@ function Audiobook:_initSubmodules()
         self.transcoder = nil
     end
 
+    -- ── Book <-> audiobook position pairing (same-named EPUB + audio) ──
+    if self.media_sync then
+        local ok_pair, err_pair = pcall(function()
+            local BookAudioSync = dofile(pp .. "bookaudiosync.lua")
+            BookAudioSync.install(self, { _ = _, plugin_path = pp })
+        end)
+        if not ok_pair then
+            logger.warn("Audiobook: book/audio pairing failed to load:", err_pair)
+        end
+    end
+
     -- ── Audiobookshelf modules (always load; works without a document) ──
     local ok_abs, err_abs = pcall(function()
         local ABSSync = dofile(pp .. "abssync.lua")
@@ -597,6 +608,16 @@ function Audiobook:addToMainMenu(menu_items)
                     if touchmenu_instance then touchmenu_instance:closeMenu() end
                     self:openAudioFile()
                 end,
+            },
+            {
+                text = _("Sync book page with audiobook"),
+                enabled_func = function()
+                    return self._pairMenuItems ~= nil
+                end,
+                sub_item_table_func = function()
+                    return self._pairMenuItems and self:_pairMenuItems() or {}
+                end,
+                help_text = _("For an ebook with an audiobook of the same name next to it (Book.epub + Book.m4b): start the audio at your page, and keep the page following the audio."),
             },
             -- ── Audiobookshelf ──
             -- Configuration/log-in should be reachable even if the media
@@ -1573,6 +1594,11 @@ function Audiobook:_startMediaPlaybackForDocument(doc_path)
 
     -- No SMIL: try to auto-detect a matching audiobook file
     local matching_audio = self:_findMatchingAudiobook(doc_path)
+    if matching_audio and self._pairStart and self:_pairMode() ~= "off" then
+        -- Offers "Play from my page" next to resuming the audio, and keeps
+        -- the book page following the audio (bookaudiosync.lua).
+        if self:_pairStart(doc_path, matching_audio) then return end
+    end
     if matching_audio then
         local ConfirmBox = require("ui/widget/confirmbox")
         UIManager:show(ConfirmBox:new{
@@ -3856,6 +3882,9 @@ end
 
 function Audiobook:onPageUpdate(cur_page, prev_page)
     if self._peeking_adjacent_page then return end
+    if self._pairOnPageUpdate then
+        pcall(self._pairOnPageUpdate, self, cur_page)
+    end
     self:_handlePageTurnFollow()
     -- TTS overlay boxes are screen coordinates.  A page turn must drop them
     -- or the underline is stamped at the old x,y on the new page.  Do not
@@ -4123,6 +4152,11 @@ function Audiobook:onSuspend()
         pcall(function() self.session_recorder:stop() end)
     end
     if not self._init_ok then return end
+    -- Turn the book to the audio's page before sleeping, so the saved and
+    -- synced reading position matches what was being listened to.
+    if self._pairBeforeSuspend then
+        pcall(self._pairBeforeSuspend, self)
+    end
     -- Handle media playback suspend
     if self.media_sync and (self.media_sync:isPlaying() or self.media_sync:isPaused()) then
         self._media_was_playing = self.media_sync:isPlaying()
@@ -4482,6 +4516,7 @@ function Audiobook:onCloseDocument()
     -- file browser fires CloseDocument, and the user expects the recording
     -- to persist across book changes. The recorder still stops on suspend,
     -- sleep-cover close, or explicit Stop.
+    if self._pairEnd then pcall(self._pairEnd, self) end
     self:stopReadAlong({ drop_chrome = true })
     self._audiobook_chrome_margins_applied = false
 end
